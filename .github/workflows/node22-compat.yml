@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   compat:
-    if: github.repository == 'openclaw/openclaw' || github.event_name == 'workflow_dispatch'
+    if: (github.repository == 'openclaw/openclaw' || github.event_name == 'workflow_dispatch') && github.ref != 'refs/heads/codex/pr113257-qa-proof'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -118,4 +118,166 @@ jobs:
           name: build-all-cache-v1-${{ runner.os }}-${{ runner.arch }}-node-22.22.3
           overwrite: true
           path: .artifacts/build-all-cache
+          retention-days: 14
+
+  qa_ui_proof:
+    # One-off secretless fork proof; this branch guard keeps the job inert on main.
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'ARYDESTROYER/openclaw' && github.ref == 'refs/heads/codex/pr113257-qa-proof'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      EXPECTED_SHA: ede7029a39066c9a318a23438fb1e09256b46bc0
+    steps:
+      - name: Checkout exact reviewed PR head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ede7029a39066c9a318a23438fb1e09256b46bc0
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+          echo "Exact PR head: $actual_sha"
+
+      - name: Set up isolated Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.15.0"
+          install-bun: "false"
+          use-actions-cache: "false"
+
+      - name: Build QA Lab UI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/qa-lab-ui-proof
+          pnpm qa:lab:build 2>&1 | tee .artifacts/qa-lab-ui-proof/build.log
+
+      - name: Prove live asset-version invalidation
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$GITHUB_WORKSPACE/.artifacts/qa-lab-ui-proof"
+          run_root="$(mktemp -d "${RUNNER_TEMP}/qa-lab-ui-proof.XXXXXX")"
+          ui_dist="$run_root/ui-dist"
+          server_log="$run_root/server.log"
+          base_url="http://127.0.0.1:43125"
+          server_pid=""
+
+          cleanup() {
+            set +e
+            if [[ -n "$server_pid" ]]; then
+              kill "$server_pid" 2>/dev/null
+              wait "$server_pid" 2>/dev/null
+            fi
+            rm -rf "$run_root"
+          }
+          trap cleanup EXIT
+
+          cp -R extensions/qa-lab/web/dist "$ui_dist"
+          cp "$ui_dist/index.html" "$run_root/index.original.html"
+
+          pnpm openclaw qa ui \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --host 127.0.0.1 \
+            --port 43125 \
+            --ui-dist-dir "$ui_dist" \
+            --embedded-gateway disabled \
+            >"$server_log" 2>&1 &
+          server_pid="$!"
+
+          ready="false"
+          for _attempt in $(seq 1 60); do
+            if curl -fsS "$base_url/readyz" >/dev/null; then
+              ready="true"
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != "true" ]]; then
+            cp "$server_log" "$artifact_dir/server.log"
+            echo "QA Lab did not become ready" >&2
+            sed -n '1,120p' "$server_log" >&2
+            exit 1
+          fi
+
+          root_http_before="$(curl -sS -o "$run_root/root-before.html" -w '%{http_code}' "$base_url/")"
+          test "$root_http_before" = "200"
+          grep -q '<title>QA Lab</title>' "$run_root/root-before.html"
+          if grep -q 'QA Lab UI not built' "$run_root/root-before.html"; then
+            echo "QA Lab served the missing-build placeholder" >&2
+            exit 1
+          fi
+
+          version_http_before="$(curl -sS -o "$run_root/version-before.json" -w '%{http_code}' "$base_url/api/ui-version")"
+          test "$version_http_before" = "200"
+          token_before="$(jq -er '.version' "$run_root/version-before.json")"
+          [[ "$token_before" =~ ^[0-9a-f]{12}$ ]]
+
+          printf '\n<!-- qa-proof-content-change -->\n' >> "$ui_dist/index.html"
+
+          version_http_after="$(curl -sS -o "$run_root/version-after.json" -w '%{http_code}' "$base_url/api/ui-version")"
+          test "$version_http_after" = "200"
+          token_after="$(jq -er '.version' "$run_root/version-after.json")"
+          [[ "$token_after" =~ ^[0-9a-f]{12}$ ]]
+          test "$token_after" != "$token_before"
+
+          root_http_after="$(curl -sS -o "$run_root/root-after.html" -w '%{http_code}' "$base_url/")"
+          test "$root_http_after" = "200"
+          grep -q '<title>QA Lab</title>' "$run_root/root-after.html"
+
+          cp "$run_root/index.original.html" "$ui_dist/index.html"
+          token_restored="$(curl -fsS "$base_url/api/ui-version" | jq -er '.version')"
+          test "$token_restored" = "$token_before"
+
+          tracked_status="$(git status --short)"
+          test -z "$tracked_status"
+
+          {
+            echo "QA Lab real runtime proof"
+            echo "source_sha=$EXPECTED_SHA"
+            echo "environment=$(uname -srmo)"
+            echo "node=$(node --version)"
+            echo "pnpm=$(pnpm --version)"
+            echo "build=passed"
+            echo "server_command=pnpm openclaw qa ui --ui-dist-dir <temporary-built-ui-copy> --port 43125 --embedded-gateway disabled"
+            echo "readyz=200"
+            echo "root_before_http=$root_http_before"
+            echo "root_after_http=$root_http_after"
+            echo "rendered_ui_title=QA Lab"
+            echo "missing_build_placeholder=false"
+            echo "ui_version_before_http=$version_http_before"
+            echo "ui_version_before=$token_before"
+            echo "asset_change=appended harmless HTML comment to temporary index.html copy"
+            echo "ui_version_after_http=$version_http_after"
+            echo "ui_version_after=$token_after"
+            echo "tokens_are_12_char_lowercase_hex=true"
+            echo "token_changed=true"
+            echo "token_restored_after_revert=true"
+            echo "tracked_worktree_changes=none"
+          } | tee "$artifact_dir/qa-lab-ui-proof.txt"
+
+          cp "$server_log" "$artifact_dir/server.log"
+          {
+            echo "## QA Lab UI asset-version proof"
+            echo
+            echo '```text'
+            cat "$artifact_dir/qa-lab-ui-proof.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload proof artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-113257-qa-lab-ui-proof
+          path: .artifacts/qa-lab-ui-proof/
+          if-no-files-found: warn
           retention-days: 14
