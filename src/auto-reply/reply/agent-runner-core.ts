@@ -9,15 +9,12 @@ import {
   type SessionEntry,
 } from "../../config/sessions.js";
 import { loadSessionEntryReadOnly } from "../../config/sessions/session-accessor.js";
-import {
-  formatSqliteSessionFileMarker,
-  sqliteSessionFileMarkerMatchesSession,
-} from "../../config/sessions/sqlite-marker.js";
 import { parseSessionThreadInfoFast } from "../../config/sessions/thread-info.js";
 import type { TypingMode } from "../../config/types.js";
 import { logVerbose } from "../../globals.js";
 import { CommandLaneClearedError, GatewayDrainingError } from "../../process/command-queue.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
+import { sessionDeliveryChannel } from "../../utils/delivery-context.shared.js";
 import {
   type DeliveryContext,
   normalizeDeliveryContext,
@@ -33,7 +30,10 @@ import type { TemplateContext } from "../templating.js";
 import type { VerboseLevel } from "../thinking.js";
 import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
-import { buildKnownAgentRunFailureReplyPayload } from "./agent-runner-failure-reply.js";
+import {
+  buildKnownAgentRunFailureReplyPayload,
+  buildTerminalAgentRunFailureReplyPayload,
+} from "./agent-runner-failure-reply.js";
 import type { BlockReplyPipeline } from "./block-reply-pipeline.js";
 import { resolveEffectiveReplyRoute } from "./effective-reply-route.js";
 import type { InternalGetReplyOptions } from "./get-reply.types.js";
@@ -133,7 +133,7 @@ export function resolveSourceReplyPolicy(params: {
       params.sessionCtx.OriginatingChannel ??
       params.sessionCtx.Surface ??
       params.sessionCtx.Provider ??
-      params.sessionEntry?.channel,
+      sessionDeliveryChannel(params.sessionEntry),
     chatType: params.sessionEntry?.chatType,
   });
   return resolveSourceReplyVisibilityPolicy({
@@ -355,20 +355,11 @@ export function resolveAdmittedRunSessionFile(params: {
   agentId: string;
   sessionId: string;
   sessionFile?: string;
+  sessionKey?: string;
   storePath?: string;
 }): string | undefined {
-  if (
-    params.sessionFile &&
-    sqliteSessionFileMarkerMatchesSession(params.sessionFile, params.sessionId)
-  ) {
-    return params.sessionFile;
-  }
-  if (params.storePath) {
-    return formatSqliteSessionFileMarker({
-      agentId: params.agentId,
-      sessionId: params.sessionId,
-      storePath: params.storePath,
-    });
+  if (params.sessionKey?.trim()) {
+    return params.sessionKey.trim();
   }
   return params.sessionFile;
 }
@@ -377,6 +368,9 @@ export async function handleReplyAgentRunError(
   error: unknown,
   context: {
     cfg: OpenClawConfig;
+    blockReplyPipeline: BlockReplyPipeline | null;
+    didDeliverVisiblePartialReply: () => boolean;
+    isHeartbeat: boolean;
     isRestartRecoveryArmed: () => boolean;
     replyOperation: ReplyOperation;
     resolvedVerboseLevel: VerboseLevel;
@@ -386,6 +380,9 @@ export async function handleReplyAgentRunError(
 ): Promise<ReplyPayload | undefined> {
   const {
     cfg,
+    blockReplyPipeline,
+    didDeliverVisiblePartialReply,
+    isHeartbeat,
     isRestartRecoveryArmed,
     replyOperation,
     resolvedVerboseLevel,
@@ -437,6 +434,28 @@ export async function handleReplyAgentRunError(
   if (knownFailurePayload) {
     replyOperation.fail("run_failed", error);
     return returnWithQueuedFollowupDrain(knownFailurePayload);
+  }
+  if (blockReplyPipeline) {
+    try {
+      await blockReplyPipeline.flush({ force: true });
+    } catch (flushError) {
+      logVerbose(
+        `failed to flush streamed reply blocks before surfacing run failure: ${String(flushError)}`,
+      );
+    }
+  }
+  const didDeliverVisibleReply =
+    (blockReplyPipeline?.didStreamTerminalReply?.() === true && !blockReplyPipeline.isAborted()) ||
+    didDeliverVisiblePartialReply();
+  if (!isHeartbeat && didDeliverVisibleReply && !replyOperation.abortSignal.aborted) {
+    replyOperation.fail("run_failed", error);
+    return returnWithQueuedFollowupDrain(
+      buildTerminalAgentRunFailureReplyPayload({
+        visibleReplyDelivered: true,
+        sessionCtx,
+        cfg,
+      }),
+    );
   }
   replyOperation.fail("run_failed", error);
   // Keep the followup queue moving even when an unexpected exception escapes

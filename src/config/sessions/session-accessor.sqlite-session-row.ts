@@ -1,20 +1,41 @@
 import {
+  deliveryContextFromSession,
+  sessionDeliveryChannel,
+} from "../../utils/delivery-context.shared.js";
+import {
   normalizeSqliteChatType,
   normalizeSqliteText,
 } from "./session-accessor.sqlite-normalize.js";
 import { bindSessionEntryProvenance } from "./session-accessor.sqlite-provenance.js";
 import { normalizeSqliteStatus } from "./session-accessor.sqlite-status.js";
+import { projectCanonicalSessionEntryShape } from "./store-entry-shape.js";
 import type { SessionEntry } from "./types.js";
 
 export function normalizeSqliteSessionEntryTimestamp(entry: SessionEntry): SessionEntry {
+  const raw = entry as unknown as Record<string, unknown>;
+  const hasLegacyDeliveryFields = [
+    "route",
+    "deliveryContext",
+    "origin",
+    "channel",
+    "lastChannel",
+    "lastTo",
+    "lastAccountId",
+    "lastThreadId",
+  ].some((key) => key in raw);
+  const delivery =
+    entry.delivery ?? (hasLegacyDeliveryFields ? undefined : { kind: "none" as const });
   if (typeof entry.updatedAt === "number" && Number.isFinite(entry.updatedAt)) {
-    return entry;
+    if (entry.delivery === delivery) {
+      return entry;
+    }
+    return delivery ? { ...entry, delivery } : entry;
   }
   const updatedAt =
     typeof entry.sessionStartedAt === "number" && Number.isFinite(entry.sessionStartedAt)
       ? entry.sessionStartedAt
       : Date.now();
-  return { ...entry, updatedAt };
+  return delivery ? { ...entry, delivery, updatedAt } : { ...entry, updatedAt };
 }
 
 export function bindSqliteSessionRoot(params: {
@@ -28,19 +49,28 @@ export function bindSqliteSessionRoot(params: {
   return {
     session_id: params.entry.sessionId,
     session_key: params.sessionKey,
-    previous_session_id: normalizeSqliteText(params.entry.previousSessionId),
     reason: null,
-    session_scope: resolveSqliteSessionScope(params.entry, params.sessionKey),
     created_at: resolveSqliteSessionCreatedAt(params.entry, updatedAt),
     updated_at: updatedAt,
     ...bindSessionEntryProvenance(params.entry),
+    ...bindSqliteSessionWindowEntryProjection(params),
+    primary_conversation_id: null,
+  };
+}
+
+export function bindSqliteSessionWindowEntryProjection(params: {
+  entry: SessionEntry;
+  sessionKey: string;
+}) {
+  return {
+    previous_session_id: normalizeSqliteText(params.entry.previousSessionId),
+    session_scope: resolveSqliteSessionScope(params.entry, params.sessionKey),
     started_at: finiteSqliteNumber(params.entry.startedAt),
     ended_at: finiteSqliteNumber(params.entry.endedAt),
     status: normalizeSqliteStatus(params.entry.status),
     chat_type: normalizeSqliteChatType(params.entry.chatType),
     channel: resolveSqliteSessionChannel(params.entry),
     account_id: resolveSqliteSessionAccountId(params.entry),
-    primary_conversation_id: null,
     model_provider: normalizeSqliteText(params.entry.modelProvider),
     model: normalizeSqliteText(params.entry.model),
     agent_harness_id: normalizeSqliteText(params.entry.agentHarnessId),
@@ -56,6 +86,9 @@ export function bindSqliteSessionNode(params: {
   sessionKey: string;
   updatedAt: number;
 }) {
+  const canonicalEntry = projectCanonicalSessionEntryShape(
+    params.entry as unknown as Record<string, unknown>,
+  );
   const actor = params.entry.createdActor;
   const legacyActorId = normalizeSqliteText(
     (params.entry as SessionEntry & { createdBy?: { id?: unknown } }).createdBy?.id,
@@ -63,7 +96,8 @@ export function bindSqliteSessionNode(params: {
   return {
     session_key: params.sessionKey,
     current_session_id: params.entry.sessionId,
-    entry_json: JSON.stringify(params.entry),
+    entry_json: JSON.stringify(canonicalEntry),
+    entry_valid: 1,
     updated_at: params.updatedAt,
     status: normalizeSqliteStatus(params.entry.status),
     created_at: finiteSqliteNumber(params.entry.createdAt),
@@ -136,20 +170,11 @@ function finiteSqliteNumber(value: unknown): number | null {
 }
 
 function resolveSqliteSessionChannel(entry: SessionEntry): string | null {
-  return (
-    normalizeSqliteText(entry.channel) ??
-    normalizeSqliteText(entry.deliveryContext?.channel) ??
-    normalizeSqliteText(entry.lastChannel) ??
-    normalizeSqliteText(entry.origin?.provider)
-  );
+  return normalizeSqliteText(sessionDeliveryChannel(entry));
 }
 
 function resolveSqliteSessionAccountId(entry: SessionEntry): string | null {
-  return (
-    normalizeSqliteText(entry.deliveryContext?.accountId) ??
-    normalizeSqliteText(entry.lastAccountId) ??
-    normalizeSqliteText(entry.origin?.accountId)
-  );
+  return normalizeSqliteText(deliveryContextFromSession(entry)?.accountId);
 }
 
 function resolveSqliteSessionDisplayName(entry: SessionEntry): string | null {

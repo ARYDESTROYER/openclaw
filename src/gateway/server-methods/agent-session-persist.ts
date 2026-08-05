@@ -1,11 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
-import {
-  isMainSessionRecoveryExhausted,
-  transitionMainSessionRecovery,
-} from "../../agents/main-session-recovery-state.js";
+import { transitionMainSessionRecovery } from "../../agents/main-session-recovery-state.js";
 import type { MainSessionRecoveryOwnerLease } from "../../agents/main-session-recovery-store.js";
+import { MAX_RECOVERY_RETRIES } from "../../agents/main-session-restart-recovery-shared.js";
 import {
   mergeSessionEntry,
   resolveSessionLifecycleTimestamps,
@@ -25,6 +23,7 @@ import { assertAgentRunLifecycleGenerationCurrent } from "../../infra/agent-even
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { recordSessionCreated } from "../../sessions/session-state-events.js";
 import { getGeneratedMediaTaskIdsForSessionKey } from "../../tasks/task-status-access.js";
+import { sessionDeliveryChannel } from "../../utils/delivery-context.shared.js";
 import { formatForLog } from "../ws-log.js";
 import {
   assertExpectedExistingSession,
@@ -131,6 +130,7 @@ export async function persistAgentSessionPhase(params: {
           entry: params.entry,
           storePath: params.storePath,
           agentId: params.sessionAgentId,
+          sessionKey: params.canonicalSessionKey,
         }).sessionStartedAt
       : undefined;
 
@@ -186,7 +186,10 @@ export async function persistAgentSessionPhase(params: {
               !params.isRestartRecoveryResumeRun &&
               internalFreshEntry &&
               (internalFreshEntry.mainRestartRecovery?.tombstone ||
-                isMainSessionRecoveryExhausted(internalFreshEntry))
+                (internalFreshEntry.status === "running" &&
+                  internalFreshEntry.abortedLastRun === true &&
+                  (internalFreshEntry.mainRestartRecovery?.chargedAttempts ?? 0) >=
+                    MAX_RECOVERY_RETRIES))
             ) {
               restartRecoveryReservationConflict =
                 `Session "${params.canonicalSessionKey}" is quarantined after restart recovery ` +
@@ -322,7 +325,7 @@ export async function persistAgentSessionPhase(params: {
                 cfg: params.cfg,
                 entry: merged,
                 sessionKey: params.canonicalSessionKey,
-                channel: merged.channel,
+                channel: sessionDeliveryChannel(merged),
                 chatType: merged.chatType,
               }) === "deny"
             ) {
@@ -465,10 +468,9 @@ export async function persistAgentSessionPhase(params: {
       sessionKey: params.canonicalSessionKey,
       sessionId: resolvedSessionId,
       storePath: params.storePath,
-      sessionFile: sessionEntry?.sessionFile,
       agentId: params.sessionAgentId,
+      workspaceDir: params.entry?.spawnedWorkspaceDir,
       previousSessionId,
-      previousSessionFile: previousSessionId ? params.entry?.sessionFile : undefined,
       previousEndReason: previousSessionId
         ? (freshness?.staleReason ??
           (usableRequestedSessionId && params.entry?.sessionId !== usableRequestedSessionId
@@ -483,7 +485,7 @@ export async function persistAgentSessionPhase(params: {
       cfg: params.cfg,
       entry: sessionEntry,
       sessionKey: params.canonicalSessionKey,
-      channel: sessionEntry?.channel,
+      channel: sessionDeliveryChannel(sessionEntry),
       chatType: sessionEntry?.chatType,
     }) === "deny"
   ) {

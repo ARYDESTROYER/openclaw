@@ -10,14 +10,11 @@ vi.mock("./doctor-bootstrap-size.js", () => ({
 }));
 
 vi.mock("./doctor-auth-flat-profiles.js", () => ({
-  maybeRepairCanonicalApiKeyFieldAlias: vi.fn(async (params: { cfg: unknown }) => params.cfg),
   maybeMigrateAuthProfileJsonStoresToSqlite: vi.fn().mockResolvedValue({
     changes: [],
     warnings: [],
   }),
-  maybeRepairLegacyFlatAuthProfileStores: vi.fn().mockResolvedValue(undefined),
   maybeRepairOpenAICodexAuthConfig: vi.fn((cfg: unknown) => cfg),
-  maybeRepairOpenAICodexAuthProfileStores: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("./doctor-auth-legacy-oauth.js", () => ({
@@ -59,6 +56,9 @@ vi.mock("./doctor/cron/index.js", () => ({
 }));
 
 vi.mock("./doctor/cron/legacy-repair.js", () => ({
+  collectCronCodexRuntimePolicyTargetsReadOnly: vi
+    .fn()
+    .mockResolvedValue({ targets: [], warnings: [] }),
   repairLegacyCronStoreWithoutPrompt: vi.fn().mockResolvedValue({ changes: [], warnings: [] }),
 }));
 
@@ -147,10 +147,6 @@ vi.mock("./doctor-workspace-status.js", () => ({
 
 vi.mock("../flows/doctor-startup-channel-maintenance.js", () => ({
   maybeRunDoctorStartupChannelMaintenance: vi.fn().mockResolvedValue(undefined),
-}));
-
-vi.mock("./doctor-heartbeat-template-repair.js", () => ({
-  maybeRepairHeartbeatTemplate: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("./doctor-heartbeat-cadence-migration.js", () => ({
